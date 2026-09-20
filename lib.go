@@ -138,7 +138,14 @@ func (f *File) readTemp(name string) (file *os.File, err error) {
 // saveFileList provides a function to update given file content in file list
 // of spreadsheet.
 func (f *File) saveFileList(name string, content []byte) {
-	f.Pkg.Store(name, append([]byte(xml.Header), content...))
+	content = append([]byte(xml.Header), content...)
+	f.Pkg.Store(name, content)
+	if f.inSave && f.options != nil && f.options.SaveProgress != nil {
+		f.saveProgress = max(f.saveProgress+int64(len(content)), f.saveReported)
+		f.savePending = 0
+		f.saveReported = f.saveProgress
+		f.reportSaveProgress(f.saveProgress)
+	}
 }
 
 // Read file content as string in an archive file.

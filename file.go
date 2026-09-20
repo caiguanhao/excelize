@@ -161,6 +161,11 @@ func (f *File) WriteToBuffer() (*bytes.Buffer, error) {
 
 // writeToZip provides a function to write to ZipWriter.
 func (f *File) writeToZip(zw ZipWriter) error {
+	f.inSave = true
+	f.saveProgress, f.savePending, f.saveReported, f.saveTotal = 0, 0, 0, 0
+	if f.options != nil && f.options.SaveProgress != nil {
+		f.saveTotal = f.estimateSaveTotal()
+	}
 	f.calcChainWriter()
 	f.commentsWriter()
 	f.contentTypesWriter()
@@ -174,6 +179,8 @@ func (f *File) writeToZip(zw ZipWriter) error {
 	f.sharedStringsWriter()
 	f.styleSheetWriter()
 	f.themeWriter()
+	f.inSave = false
+	pw := f.newProgressWriter()
 
 	for path, stream := range f.streams {
 		fi, err := zw.Create(path)
@@ -185,6 +192,9 @@ func (f *File) writeToZip(zw ZipWriter) error {
 			_ = stream.rawData.Close()
 			return err
 		}
+		if pw != nil {
+			from = io.TeeReader(from, pw)
+		}
 		written, err := io.Copy(fi, from)
 		if err != nil {
 			return err
@@ -194,7 +204,7 @@ func (f *File) writeToZip(zw ZipWriter) error {
 		}
 	}
 	var (
-		n                int
+		written          int64
 		err              error
 		files, tempFiles []string
 	)
@@ -212,7 +222,7 @@ func (f *File) writeToZip(zw ZipWriter) error {
 			break
 		}
 		content, _ := f.Pkg.Load(path)
-		if n, err = fi.Write(content.([]byte)); int64(n) > math.MaxUint32 {
+		if written, err = pw.writePart(fi, content.([]byte)); written > math.MaxUint32 {
 			f.zip64Entries = append(f.zip64Entries, path)
 		}
 	}
@@ -229,11 +239,251 @@ func (f *File) writeToZip(zw ZipWriter) error {
 		if fi, err = zw.Create(path); err != nil {
 			break
 		}
-		if n, err = fi.Write(f.readBytes(path)); int64(n) > math.MaxUint32 {
+		if written, err = pw.writePart(fi, f.readBytes(path)); written > math.MaxUint32 {
 			f.zip64Entries = append(f.zip64Entries, path)
 		}
 	}
+	if pw != nil && err == nil {
+		pw.report(pw.total)
+	}
 	return err
+}
+
+// progressWriter implements an io.Writer that tracks the number of bytes
+// written to the ZIP archive and reports progress through a callback function.
+type progressWriter struct {
+	callback  func(processed, total int64)
+	processed int64
+	total     int64
+	threshold int64
+	last      int64
+}
+
+// newProgressWriter creates a progressWriter to report saving progress if the
+// SaveProgress callback function was set in the options, otherwise returns
+// nil. The total size is the sum of bytes serialized in the preparation phase
+// and the size of all parts to be written to the ZIP archive.
+func (f *File) newProgressWriter() *progressWriter {
+	if f.options == nil || f.options.SaveProgress == nil {
+		return nil
+	}
+	pw := &progressWriter{
+		callback:  f.options.SaveProgress,
+		processed: f.saveProgress,
+		total:     f.saveProgress,
+	}
+	f.Pkg.Range(func(path, content interface{}) bool {
+		if _, ok := f.streams[path.(string)]; !ok {
+			pw.total += int64(len(content.([]byte)))
+		}
+		return true
+	})
+	pw.total += f.storedPartsSize()
+	pw.threshold = progressStep(pw.total)
+	return pw
+}
+
+// streamPartSize returns the size of the stream writer raw data in bytes.
+func streamPartSize(stream *StreamWriter) int64 {
+	size := int64(stream.rawData.buf.Len())
+	if stream.rawData.tmp != nil {
+		if fi, err := stream.rawData.tmp.Stat(); err == nil {
+			size += fi.Size()
+		}
+	}
+	return size
+}
+
+// tempFileSize returns the size of a temporary file in bytes, or 0 if the
+// file size is unavailable.
+func tempFileSize(tempFile string) int64 {
+	if fi, err := os.Stat(tempFile); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+// storedPartsSize returns the total size in bytes of the stream writer parts
+// and the temporary file parts not pending serialization into the package.
+func (f *File) storedPartsSize() int64 {
+	var size int64
+	for _, stream := range f.streams {
+		size += streamPartSize(stream)
+	}
+	f.tempFiles.Range(func(path, tempFile interface{}) bool {
+		_, stored := f.Pkg.Load(path)
+		_, sheet := f.Sheet.Load(path)
+		if !stored && !sheet {
+			size += tempFileSize(tempFile.(string))
+		}
+		return true
+	})
+	return size
+}
+
+// estimateSampleSize is the number of worksheet rows or shared string items
+// encoded to estimate their serialized size.
+const estimateSampleSize = 128
+
+// estimateSaveTotal estimates the total progress value in bytes before
+// serialization begins: twice the estimated size of the parts to be
+// serialized (once for serialization and once for writing them to the ZIP
+// archive), plus the exact size of stream and temporary file parts.
+func (f *File) estimateSaveTotal() int64 {
+	var est int64
+	f.Sheet.Range(func(_, ws interface{}) bool {
+		if sheet, ok := ws.(*xlsxWorksheet); ok && sheet != nil {
+			est += estimateSheetXMLSize(sheet)
+		}
+		return true
+	})
+	if f.SharedStrings != nil {
+		est += estimateSSTXMLSize(f.SharedStrings)
+	}
+	f.Pkg.Range(func(path, content interface{}) bool {
+		name := path.(string)
+		_, streamed := f.streams[name]
+		_, sheet := f.Sheet.Load(name)
+		sharedStrings := name == defaultXMLPathSharedStrings && f.SharedStrings != nil
+		if !streamed && !sheet && !sharedStrings {
+			est += int64(len(content.([]byte)))
+		}
+		return true
+	})
+	return 2*est + f.storedPartsSize()
+}
+
+// estimateSheetXMLSize estimates the serialized size of the given worksheet
+// in bytes by encoding a uniform sample of its rows.
+func estimateSheetXMLSize(sheet *xlsxWorksheet) int64 {
+	rows := sheet.SheetData.Row
+	if len(rows) <= 2*estimateSampleSize {
+		if output, err := xml.Marshal(sheet); err == nil {
+			return int64(len(xml.Header) + len(output))
+		}
+		return 0
+	}
+	// Temporarily swap the rows of the worksheet to encode a sample of them
+	// instead of copying the worksheet structure, which contains a mutex.
+	defer func(orig []xlsxRow) { sheet.SheetData.Row = orig }(rows)
+	sheet.SheetData.Row = nil
+	base, err := xml.Marshal(sheet)
+	if err != nil {
+		return 0
+	}
+	sampled := make([]xlsxRow, 0, estimateSampleSize)
+	for i := 0; i < len(rows); i += len(rows) / estimateSampleSize {
+		sampled = append(sampled, rows[i])
+	}
+	sheet.SheetData.Row = sampled
+	output, err := xml.Marshal(sheet)
+	if err != nil {
+		return 0
+	}
+	rowSize := len(output) - len(base)
+	return int64(len(xml.Header) + len(base) + rowSize*len(rows)/len(sampled))
+}
+
+// estimateSSTXMLSize estimates the serialized size of the shared strings
+// table in bytes by encoding a uniform sample of its string items.
+func estimateSSTXMLSize(sst *xlsxSST) int64 {
+	items := sst.SI
+	if len(items) <= 2*estimateSampleSize {
+		if output, err := xml.Marshal(sst); err == nil {
+			return int64(len(xml.Header) + len(output))
+		}
+		return 0
+	}
+	// Temporarily swap the items of the shared strings table to encode a
+	// sample of them instead of copying the structure, which contains a mutex.
+	defer func(orig []xlsxSI) { sst.SI = orig }(items)
+	sampled := make([]xlsxSI, 0, estimateSampleSize)
+	for i := 0; i < len(items); i += len(items) / estimateSampleSize {
+		sampled = append(sampled, items[i])
+	}
+	sst.SI = sampled
+	output, err := xml.Marshal(sst)
+	if err != nil {
+		return 0
+	}
+	return int64(len(xml.Header) + len(output)*len(items)/len(sampled))
+}
+
+// progressStep returns the progress report step size in bytes for the given
+// processed or total size: about 1% of it, at least 64KB.
+func progressStep(size int64) int64 {
+	if step := size/100 + 1; step > 64<<10 {
+		return step
+	}
+	return 64 << 10
+}
+
+// wrapSaveProgress wraps w with an io.Writer that reports serialization
+// progress if the SaveProgress callback function was set in the options and
+// the file is being saved, otherwise returns w unchanged.
+func (f *File) wrapSaveProgress(w io.Writer) io.Writer {
+	if f.inSave && f.options != nil && f.options.SaveProgress != nil {
+		return &serializeProgressWriter{f: f, w: w}
+	}
+	return w
+}
+
+// serializeProgressWriter implements an io.Writer that counts the bytes
+// produced during serialization and reports throttled progress with an
+// indeterminate total size.
+type serializeProgressWriter struct {
+	f *File
+	w io.Writer
+}
+
+// Write writes p to the underlying writer, accumulates the number of bytes
+// written and reports serialization progress.
+func (sw *serializeProgressWriter) Write(p []byte) (int, error) {
+	n, err := sw.w.Write(p)
+	sw.f.savePending += int64(n)
+	if processed := sw.f.saveProgress + sw.f.savePending; processed-sw.f.saveReported >= progressStep(processed) {
+		sw.f.saveReported = processed
+		sw.f.reportSaveProgress(processed)
+	}
+	return n, err
+}
+
+// reportSaveProgress invokes the SaveProgress callback function with the
+// processed bytes and the estimated or exact total size in bytes.
+func (f *File) reportSaveProgress(processed int64) {
+	f.options.SaveProgress(processed, max(f.saveTotal, processed))
+}
+
+// Write implements io.Writer, accumulates the number of bytes written and
+// reports progress.
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	pw.processed += int64(len(p))
+	pw.report(pw.processed)
+	return len(p), nil
+}
+
+// writePart writes data to w and returns the number of bytes written. If the
+// SaveProgress callback function was set, the data is written in chunks so
+// that the progress is reported continuously while writing.
+func (pw *progressWriter) writePart(w io.Writer, data []byte) (int64, error) {
+	if pw == nil {
+		n, err := w.Write(data)
+		return int64(n), err
+	}
+	return io.Copy(w, io.TeeReader(bytes.NewReader(data), pw))
+}
+
+// report invokes the callback function with the processed and total bytes
+// when the progress exceeds the threshold or has completed.
+func (pw *progressWriter) report(processed int64) {
+	if processed > pw.total {
+		processed = pw.total
+	}
+	if processed == pw.last || (processed != pw.total && processed-pw.last < pw.threshold) {
+		return
+	}
+	pw.callback(processed, pw.total)
+	pw.last = processed
 }
 
 // writeZip64LFH function sets the ZIP version to 0x2D (45) in the Local File

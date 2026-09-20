@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"math"
@@ -273,4 +275,179 @@ func TestRemoveTempFiles(t *testing.T) {
 		t.Errorf("temp file %q still exist", tmpName)
 		assert.NoError(t, os.Remove(tmpName))
 	}
+}
+
+func TestWriteToBufferProgress(t *testing.T) {
+	type report struct{ processed, total int64 }
+	var reports []report
+	progress := func(processed, total int64) {
+		reports = append(reports, report{processed, total})
+	}
+	check := func(t *testing.T) {
+		require.NotEmpty(t, reports)
+		assert.Greater(t, reports[0].total, int64(0)) // estimated total
+		for i := 1; i < len(reports); i++ {
+			assert.GreaterOrEqual(t, reports[i].processed, reports[i-1].processed)
+		}
+		last := reports[len(reports)-1]
+		assert.Equal(t, last.total, last.processed)
+		assert.Greater(t, last.total, int64(0))
+	}
+
+	// Test save progress with the normal writer
+	f := NewFile(Options{SaveProgress: progress})
+	for row := 1; row <= 100; row++ {
+		for col := 1; col <= 10; col++ {
+			cell, err := CoordinatesToCellName(col, row)
+			require.NoError(t, err)
+			require.NoError(t, f.SetCellValue("Sheet1", cell, row*col))
+		}
+	}
+	buf, err := f.WriteToBuffer()
+	require.NoError(t, err)
+	check(t)
+	_, err = zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	assert.NoError(t, err)
+
+	// Test save progress is reset on the second save
+	reports = reports[:0]
+	_, err = f.WriteToBuffer()
+	require.NoError(t, err)
+	check(t)
+	require.NoError(t, f.Close())
+
+	// Test save progress with the stream writer
+	reports = reports[:0]
+	f = NewFile(Options{SaveProgress: progress})
+	sw, err := f.NewStreamWriter("Sheet1")
+	require.NoError(t, err)
+	for row := 1; row <= 100; row++ {
+		cell, err := CoordinatesToCellName(1, row)
+		require.NoError(t, err)
+		require.NoError(t, sw.SetRow(cell, []interface{}{row}))
+	}
+	require.NoError(t, sw.Flush())
+	_, err = f.WriteToBuffer()
+	require.NoError(t, err)
+	check(t)
+	require.NoError(t, f.Close())
+
+	// Test save progress with password protection
+	reports = reports[:0]
+	f = NewFile(Options{Password: "password", SaveProgress: progress})
+	require.NoError(t, f.SetCellValue("Sheet1", "A1", "Hello"))
+	_, err = f.WriteToBuffer()
+	require.NoError(t, err)
+	check(t)
+	require.NoError(t, f.Close())
+}
+
+func TestProgressWriter(t *testing.T) {
+	var calls int
+	var processed, total int64
+	pw := &progressWriter{
+		callback:  func(p, t int64) { calls++; processed, total = p, t },
+		total:     210,
+		threshold: 64,
+	}
+	// Report nothing when the progress does not exceed the threshold
+	_, err := pw.Write(make([]byte, 50))
+	assert.NoError(t, err)
+	assert.Zero(t, calls)
+	// Report the progress clamped to the total when overflowing
+	_, err = pw.Write(make([]byte, 200))
+	assert.NoError(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(210), processed)
+	assert.Equal(t, int64(210), total)
+	// Report nothing when the progress does not change
+	pw.report(210)
+	assert.Equal(t, 1, calls)
+}
+
+func TestSerializeProgressWriter(t *testing.T) {
+	var reports []int64
+	f := NewFile(Options{SaveProgress: func(processed, total int64) {
+		assert.Equal(t, processed, total) // clamped to processed without an estimate
+		reports = append(reports, processed)
+	}})
+	defer func() { assert.NoError(t, f.Close()) }()
+
+	// No wrapper when the file is not being saved
+	buf := bytes.Buffer{}
+	assert.Equal(t, &buf, f.wrapSaveProgress(&buf))
+
+	f.inSave = true
+	w := f.wrapSaveProgress(&buf)
+	// Report nothing when the progress does not exceed the threshold
+	_, err := w.Write(make([]byte, 1000))
+	assert.NoError(t, err)
+	assert.Empty(t, reports)
+	// Report the progress with pending bytes included
+	_, err = w.Write(make([]byte, 100<<10))
+	assert.NoError(t, err)
+	assert.Equal(t, []int64{100<<10 + 1000}, reports)
+	// Commit the pending bytes on saveFileList
+	f.saveFileList("docProps/core.xml", buf.Bytes())
+	assert.Equal(t, []int64{100<<10 + 1000, int64(buf.Len()) + int64(len(xml.Header))}, reports)
+	assert.Zero(t, f.savePending)
+}
+
+func TestWriteToBufferEstimatedTotal(t *testing.T) {
+	var reports [][2]int64
+	f := NewFile(Options{SaveProgress: func(processed, total int64) {
+		reports = append(reports, [2]int64{processed, total})
+	}})
+	for row := 1; row <= 2000; row++ {
+		for col := 1; col <= 10; col++ {
+			cell, err := CoordinatesToCellName(col, row)
+			require.NoError(t, err)
+			require.NoError(t, f.SetCellValue("Sheet1", cell, fmt.Sprintf("order-%d-%d", row, col)))
+		}
+	}
+	_, err := f.WriteToBuffer()
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.NotEmpty(t, reports)
+	estimated, final := reports[0][1], reports[len(reports)-1]
+	assert.Positive(t, estimated)
+	assert.Equal(t, final[1], final[0])
+	// The estimated total is close to the exact total
+	ratio := float64(estimated) / float64(final[1])
+	t.Logf("estimated total %d, exact total %d, ratio %.3f", estimated, final[1], ratio)
+	assert.Greater(t, ratio, 0.7)
+	assert.Less(t, ratio, 1.4)
+}
+
+func TestEstimateSaveTotal(t *testing.T) {
+	f := NewFile()
+	base := f.estimateSaveTotal()
+	assert.Greater(t, base, int64(0))
+	// The estimate grows with the amount of data to be serialized
+	for row := 1; row <= 500; row++ {
+		for col := 1; col <= 10; col++ {
+			cell, err := CoordinatesToCellName(col, row)
+			require.NoError(t, err)
+			require.NoError(t, f.SetCellValue("Sheet1", cell, "estimate me"))
+		}
+	}
+	grown := f.estimateSaveTotal()
+	assert.Greater(t, grown, base)
+	// The row slice of the worksheet is restored after sampling
+	_, err := f.WriteToBuffer()
+	require.NoError(t, err)
+	rows, err := f.GetRows("Sheet1")
+	require.NoError(t, err)
+	assert.Len(t, rows, 500)
+	require.NoError(t, f.Close())
+
+	// Estimate the size of a stream written worksheet exactly
+	f = NewFile()
+	sw, err := f.NewStreamWriter("Sheet1")
+	require.NoError(t, err)
+	require.NoError(t, sw.SetRow("A1", []interface{}{"stream"}))
+	require.NoError(t, sw.Flush())
+	streamEst := f.estimateSaveTotal()
+	assert.Greater(t, streamEst, int64(0))
+	require.NoError(t, f.Close())
 }

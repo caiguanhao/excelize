@@ -32,6 +32,11 @@ type File struct {
 	mu               sync.Mutex
 	checked          sync.Map
 	formulaChecked   bool
+	inSave           bool
+	savePending      int64
+	saveProgress     int64
+	saveReported     int64
+	saveTotal        int64
 	zip64Entries     []string
 	options          *Options
 	sharedStringItem [][]uint
@@ -111,6 +116,12 @@ type ZipWriter interface {
 //
 // CultureInfo specifies the country code for applying built-in language number
 // format code these effect by the system's local language settings.
+//
+// SaveProgress specifies a callback function used to report progress when
+// saving the spreadsheet. The processed and total arguments are in bytes.
+// The total is an estimated size predicted from the workbook content during
+// the serialization phase, and becomes the exact total size of all parts
+// when writing to the ZIP archive begins.
 type Options struct {
 	MaxCalcIterations uint
 	Password          string
@@ -122,6 +133,7 @@ type Options struct {
 	LongDatePattern   string
 	LongTimePattern   string
 	CultureInfo       CultureName
+	SaveProgress      func(processed, total int64)
 }
 
 // OpenFile take the name of a spreadsheet file and returns a populated

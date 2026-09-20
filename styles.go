@@ -117,8 +117,9 @@ func (f *File) themeWriter() {
 // serialize structure.
 func (f *File) sharedStringsWriter() {
 	if f.SharedStrings != nil {
-		output, _ := xml.Marshal(f.SharedStrings)
-		f.saveFileList(defaultXMLPathSharedStrings, f.replaceNameSpaceBytes(defaultXMLPathSharedStrings, output))
+		buffer := bytes.Buffer{}
+		_ = xml.NewEncoder(f.wrapSaveProgress(&buffer)).Encode(f.SharedStrings)
+		f.saveFileList(defaultXMLPathSharedStrings, f.replaceNameSpaceBytes(defaultXMLPathSharedStrings, buffer.Bytes()))
 	}
 }
 

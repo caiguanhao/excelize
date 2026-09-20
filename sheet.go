@@ -154,7 +154,7 @@ func (f *File) workSheetWriter() {
 	var (
 		arr     []byte
 		buffer  = bytes.NewBuffer(arr)
-		encoder = xml.NewEncoder(buffer)
+		encoder = xml.NewEncoder(f.wrapSaveProgress(buffer))
 	)
 	f.Sheet.Range(func(p, ws interface{}) bool {
 		if ws != nil {
